@@ -26,11 +26,12 @@ import json
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional
-
+from torch.utils.data import random_split, DataLoader, TensorDataset
 import datasets
 import evaluate
 import numpy as np
 from datasets import load_dataset, load_from_disk, Dataset, DatasetDict
+from transformers import AutoImageProcessor, ViTForImageClassification
 
 import transformers
 from transformers import (
@@ -60,6 +61,10 @@ import torch.nn as nn
 from torch.optim import AdamW
 
 import sys
+
+from src.modeling.vit import ViTHeadModel
+from src.utils import ImageNetDataset
+
 sys.path.append(
     os.path.join(
         os.getcwd(),
@@ -71,7 +76,12 @@ from src.modeling.modeling_fpt2 import FPT2LMHeadModel
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 logger = logging.getLogger(__name__)
 
-class FPT2InfoTrainer(Seq2SeqTrainer):
+from transformers import Trainer
+import torch
+import torch.nn as nn
+
+
+class ImageClassifierTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         self.target_edge_sparsity = kwargs.pop('target_edge_sparsity', 0.0)
         self.start_edge_sparsity = kwargs.pop('start_edge_sparsity', 0.0)
@@ -84,105 +94,105 @@ class FPT2InfoTrainer(Seq2SeqTrainer):
         if "num_layer_sparsity_warmup_steps" in kwargs:
             self.num_layer_sparsity_warmup_steps = kwargs.pop('num_layer_sparsity_warmup_steps')
         else:
-            self.num_layer_sparsity_warmup_steps = kwargs.pop('num_sparsity_warmup_steps', self.num_edge_sparsity_warmup_steps)
+            self.num_layer_sparsity_warmup_steps = kwargs.pop('num_sparsity_warmup_steps',
+                                                              self.num_edge_sparsity_warmup_steps)
         _ = kwargs.pop('num_sparsity_warmup_steps', None)
         self.warmup_type = kwargs.pop('warmup_type', 'linear')
         self.gpt2_model = kwargs.pop('gpt2_model', None)
         self.skip_layer_loss_if_higher_sparsity = kwargs.pop('skip_layer_loss_if_higher_sparsity', False)
+
+        self.digits = None
         self.device_count = torch.cuda.device_count()
+
         super().__init__(*args, **kwargs)
 
     def get_current_edge_target_sparsity(self, global_step):
         if global_step < self.num_edge_sparsity_warmup_steps:
             if self.warmup_type == 'linear':
                 return (
-                    self.start_edge_sparsity + (self.target_edge_sparsity - self.start_edge_sparsity) * 
-                    global_step / self.num_edge_sparsity_warmup_steps
+                        self.start_edge_sparsity + (self.target_edge_sparsity - self.start_edge_sparsity) *
+                        global_step / self.num_edge_sparsity_warmup_steps
                 )
             elif self.warmup_type == 'logarithmic':
-                log_one_minus_sparsity = math.log(1 - self.start_edge_sparsity) + (math.log(1 - self.target_edge_sparsity) - 
-                    math.log(1 - self.start_edge_sparsity)) * global_step / self.num_edge_sparsity_warmup_steps
+                log_one_minus_sparsity = math.log(1 - self.start_edge_sparsity) + (
+                            math.log(1 - self.target_edge_sparsity) -
+                            math.log(1 - self.start_edge_sparsity)) * global_step / self.num_edge_sparsity_warmup_steps
                 return 1 - math.exp(log_one_minus_sparsity)
             else:
                 raise ValueError(f'Unknown warmup type: {self.warmup_type}')
         else:
             return self.target_edge_sparsity
-        
+
     def get_current_layer_target_sparsity(self, global_step):
         if global_step < self.num_layer_sparsity_warmup_steps:
             if self.warmup_type == 'linear':
                 return (
-                    self.start_layer_sparsity + (self.target_layer_sparsity - self.start_layer_sparsity) * 
-                    global_step / self.num_layer_sparsity_warmup_steps
+                        self.start_layer_sparsity + (self.target_layer_sparsity - self.start_layer_sparsity) *
+                        global_step / self.num_layer_sparsity_warmup_steps
                 )
             elif self.warmup_type == 'logarithmic':
-                log_one_minus_sparsity = math.log(1 - self.start_layer_sparsity) + (math.log(1 - self.target_layer_sparsity) - 
-                    math.log(1 - self.start_layer_sparsity)) * global_step / self.num_layer_sparsity_warmup_steps
+                log_one_minus_sparsity = math.log(1 - self.start_layer_sparsity) + (
+                            math.log(1 - self.target_layer_sparsity) -
+                            math.log(
+                                1 - self.start_layer_sparsity)) * global_step / self.num_layer_sparsity_warmup_steps
                 return 1 - math.exp(log_one_minus_sparsity)
             else:
                 raise ValueError(f'Unknown warmup type: {self.warmup_type}')
         else:
             return self.target_layer_sparsity
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=Non):
-        start_idxes = inputs.pop("start_idxes")
-        end_idxes = inputs.pop("end_idxes")
-        _ = inputs.pop("labels")
-        corr_input_ids = inputs.pop("corr_input_ids")
-        input_ids = inputs.pop("input_ids")
-        
-        bsz = input_ids.shape[0]
-        
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        corr_images = inputs.pop("corr_inputs")
+        clean_images = inputs.pop("inputs")
+
+        bsz = clean_images.shape[0]
+
         with torch.no_grad():
             # First get the logits from the GPT-2 model
-            logits_gpt2 = self.gpt2_model(input_ids=input_ids, **inputs).logits
-            
+            gpt2_logits = self.gpt2_model(input_images=clean_images, **inputs).logits
+            gpt2_logits = torch.nn.functional.log_softmax(gpt2_logits, dim=-1)
+
             # Now run the corrupted inputs through it, and retain the activations
-            corr_x = self.gpt2_model(
-                input_ids=corr_input_ids, 
-                **inputs,
-                output_writer_states=True
-            ).writer_states
+            corr_x = self.gpt2_model(input_ids=corr_images, **inputs, output_writer_states=True).writer_states
 
             # Reshape corr_x in case we have distributed training
             tgt_shape = (-1, bsz // self.device_count, *corr_x.shape[2:])
             corr_x = corr_x.reshape(tgt_shape)
-        
+
         outputs = model(
-            input_ids=input_ids,
-            **inputs, 
+            input_ids=clean_images,
+            **inputs,
             target_edge_sparsity=self.get_current_edge_target_sparsity(self.state.global_step),
             target_node_sparsity=self.get_current_layer_target_sparsity(self.state.global_step),
             corr_x=corr_x
         )
-        
+
         reg_edge_loss = outputs["edge_loss"]
         if self.skip_layer_loss_if_higher_sparsity and outputs["model_node_sparsity"] > outputs["target_node_sparsity"]:
             reg_layer_loss = 0
         else:
             reg_layer_loss = outputs["node_loss"]
         reg_loss = reg_edge_loss + reg_layer_loss
-        logits = outputs["logits"]
-        
-        kl_loss = 0
-        for i in range(logits.shape[0]):
-            logits_i = nn.functional.log_softmax(logits[i, start_idxes[i]:end_idxes[i]], dim=-1)
-            logits_gpt2_i = nn.functional.log_softmax(logits_gpt2[i, start_idxes[i]:end_idxes[i]], dim=-1)
-            
-            kl_loss_component = nn.functional.kl_div(logits_i, logits_gpt2_i, reduction='batchmean', log_target=True)
-            kl_loss += kl_loss_component
-        kl_loss /= logits.shape[0]
-        
+
+        ## Restricting to 01-99 for now
+        # Only the last position
+        logits = outputs.logits
+        logits = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        kl_loss = nn.functional.kl_div(logits, gpt2_logits, reduction="batchmean", log_target=True)
+
         loss = kl_loss + reg_loss
         outputs["loss"] = loss
         outputs["kl_loss"] = kl_loss
+        outputs["prob_digits"] = torch.nn.functional.softmax(logits, dim=-1)
 
         return (loss, outputs) if return_outputs else loss
+
 
 @dataclass
 class DataTrainingArguments:
     dataset_path: Optional[str] = field(
-        default="./data/dataset/ioi/",
+        default="./data/datasets/gt/",
         metadata={"help": "The path to the directory with the JSON files of the task."},
     )
     train_split: Optional[str] = field(
@@ -220,7 +230,7 @@ class DataTrainingArguments:
         metadata={"help": "The initial edge sparsity of the model."}
     )
     target_edge_sparsity: Optional[float] = field(
-        default=0.97,
+        default=0.98,
         metadata={"help": "The target edge sparsity of the model."}
     )
     start_layer_sparsity: Optional[float] = field(
@@ -228,7 +238,7 @@ class DataTrainingArguments:
         metadata={"help": "The initial layer sparsity of the model."}
     )
     target_layer_sparsity: Optional[float] = field(
-        default=0.72,
+        default=0.68,
         metadata={"help": "The target layer sparsity of the model."}
     )
     stop_optimizing_layer_if_higher_sparsity: Optional[bool] = field(
@@ -351,139 +361,33 @@ def load_datasets(dataset_path, max_train_samples, max_eval_samples, train_split
             dataset["validation"] = dataset["validation"].select(range(max_eval_samples))
     return dataset
 
-baba_templates = [
-    "Then, {B} and {A} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {B} and {A} had a lot of fun at the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {B} and {A} were working at the {PLACE}. {B} decided to give a {OBJECT} to {A}",
-    "Then, {B} and {A} were thinking about going to the {PLACE}. {B} wanted to give a {OBJECT} to {A}",
-    "Then, {B} and {A} had a long argument, and afterwards {B} said to {A}",
-    "After {B} and {A} went to the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "When {B} and {A} got a {OBJECT} at the {PLACE}, {B} decided to give it to {A}",
-    "When {B} and {A} got a {OBJECT} at the {PLACE}, {B} decided to give the {OBJECT} to {A}",
-    "While {B} and {A} were working at the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "While {B} and {A} were commuting to the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "After the lunch, {B} and {A} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Afterwards, {B} and {A} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {B} and {A} had a long argument. Afterwards {B} said to {A}",
-    "The {PLACE} {B} and {A} went to had a {OBJECT}. {B} gave it to {A}",
-    "Friends {B} and {A} found a {OBJECT} at the {PLACE}. {B} gave it to {A}",
-]
-
-abba_templates = [
-    "Then, {A} and {B} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {A} and {B} had a lot of fun at the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {A} and {B} were working at the {PLACE}. {B} decided to give a {OBJECT} to {A}",
-    "Then, {A} and {B} were thinking about going to the {PLACE}. {B} wanted to give a {OBJECT} to {A}",
-    "Then, {A} and {B} had a long argument, and afterwards {B} said to {A}",
-    "After {A} and {B} went to the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "When {A} and {B} got a {OBJECT} at the {PLACE}, {B} decided to give it to {A}",
-    "When {A} and {B} got a {OBJECT} at the {PLACE}, {B} decided to give the {OBJECT} to {A}",
-    "While {A} and {B} were working at the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "While {A} and {B} were commuting to the {PLACE}, {B} gave a {OBJECT} to {A}",
-    "After the lunch, {A} and {B} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Afterwards, {A} and {B} went to the {PLACE}. {B} gave a {OBJECT} to {A}",
-    "Then, {A} and {B} had a long argument. Afterwards {B} said to {A}",
-    "The {PLACE} {A} and {B} went to had a {OBJECT}. {B} gave it to {A}",
-    "Friends {A} and {B} found a {OBJECT} at the {PLACE}. {B} gave it to {A}",
-]
-
-def try_fit_template(string, template):
-    pieces_s, pieces_t = string.strip(), template.strip()
-    
-    mapping = {}
-    
-    for s, t in zip(pieces_s.split(), pieces_t.split()):
-        if s == t:
-            continue
-        if s[-1] == t[-1] and s[-1] in [',', '.']:
-            s, t = s[:-1], t[:-1]
-        if t not in ['{A}', '{B}', '{PLACE}', '{OBJECT}']:
-            return None
-        elif t[1:-1].lower() in mapping:
-            if mapping[t[1:-1].lower()] != s:
-                return None
-        else:
-            mapping[t[1:-1].lower()] = s
-    
-    if 'place' not in mapping:
-        mapping['place'] = None
-    if 'object' not in mapping:
-        mapping['object'] = None
-    
-    return mapping
-
-def find_template(string):
-    for template in baba_templates:
-        mapping = try_fit_template(string, template)
-        if mapping is not None:
-            mapping.update({
-                'template': template,
-                'order': 'baba'
-            })
-            return mapping
-    
-    for template in abba_templates:
-        mapping = try_fit_template(string, template)
-        if mapping is not None:
-            mapping.update({
-                'template': template,
-                'order': 'abba'
-            })
-            return mapping
-    return None
-
-class DataCollatorIOI:
-    def __init__(
-        self, 
-        tokenizer,
-        max_length
-    ):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+class DataCollator:
 
     def __call__(self, examples):
-        input_ids_all = []
-        corr_input_ids_all = []
-        labels_all = []
-        start_idxes = []
-        end_idxes = []
-        
-        key = "text" if "text" in examples[0] else "ioi_sentences"
-        
-        for example in examples:
-            text = example[key]
-            corr_text = example["corr_"+key]
+        inputs = []
+        corr_inputs = []
+        labels = []         # need to pass something otherwise compute_metrics will not be called
+
+        for i, example in enumerate(examples):
+            input = example[0]
+            corr_example = examples[i+1 if i != len(examples) - 1 else 0]
             
-            last_space = text.rfind(' ')
-            non_loss_portion = text[:last_space]
-            
-            len_non_loss = self.tokenizer(non_loss_portion, return_tensors="pt").input_ids.shape[1]
-            input_ids = self.tokenizer(text, return_tensors="pt", max_length=self.max_length, padding='max_length', truncation=True).input_ids[0]
-            corr_input_ids = self.tokenizer(corr_text, return_tensors="pt", max_length=self.max_length, padding='max_length', truncation=True).input_ids[0]
-            labels = input_ids.clone()
-            labels[:len_non_loss] = -100
-            labels[labels == self.tokenizer.pad_token_id] = -100
-            
-            input_ids_all.append(input_ids)
-            corr_input_ids_all.append(corr_input_ids)
-            labels_all.append(labels)
-            
-            first_pad = (input_ids == self.tokenizer.pad_token_id).nonzero()[0]
-            start_idxes.append(len_non_loss-1)
-            end_idxes.append(first_pad-1)
-        
-        batch = {
-            "input_ids": torch.stack(input_ids_all),
-            "corr_input_ids": torch.stack(corr_input_ids_all),
-            "labels": torch.stack(labels_all),
-            "start_idxes": torch.LongTensor(start_idxes),
-            "end_idxes": torch.LongTensor(end_idxes),
+            inputs.append(input)
+            corr_inputs.append(corr_example[0])
+            labels.append(example[1])
+
+        return {
+            "inputs": torch.stack(inputs),
+            "corr_inputs": torch.stack(corr_inputs),
+            "labels": torch.tensor(labels),
         }
 
-        return batch     
-
-def eval_fn(eval_pred): 
-    logits, target_edge_sparsity, target_layer_sparsity, model_edge_sparsity, model_layer_sparsity, reg_edge_loss, reg_layer_loss, kl_loss = eval_pred.predictions
+def eval_fn(eval_pred):         
+    (
+        _, logits, reg_edge_loss, reg_layer_loss, target_edge_sparsity, target_layer_sparsity, model_edge_sparsity, model_layer_sparsity, 
+        kl_loss, prob_digits, digits
+    ) = eval_pred.predictions
+    
     if len(model_edge_sparsity.shape) > 0:
         model_edge_sparsity = model_edge_sparsity[0].item()
         model_layer_sparsity = model_layer_sparsity[0].item()
@@ -495,22 +399,23 @@ def eval_fn(eval_pred):
         target_edge_sparsity = target_edge_sparsity.item()
         target_layer_sparsity = target_layer_sparsity.item()
     
-    predictions = np.argmax(logits, axis=-1)[:, :-1]
-    labels = eval_pred.label_ids[:, 1:]
-
-    eval_mask = (labels != -100).astype(int)
-    predictions = predictions * eval_mask
-    labels = labels * eval_mask
+    probability_difference = 0
+    for i in range(digits.shape[0]):
+        probability_difference += prob_digits[i, digits[i]+1:].sum() - prob_digits[i, :digits[i]].sum()
+    probability_difference /= digits.shape[0]
     
-    correct = (predictions == labels).all(axis=1)
-    accuracy = correct.sum().item() / correct.shape[0]
+    probability_difference_10 = 0
+    for i in range(digits.shape[0]):
+        probability_difference_10 += prob_digits[i, digits[i]+1:digits[i]+10].sum() - prob_digits[i, digits[i]-10:digits[i]].sum()
+    probability_difference_10 /= digits.shape[0]
     
     kl_loss = kl_loss.mean().item()
     reg_edge_loss = reg_edge_loss.mean().item()
     reg_layer_loss = reg_layer_loss.mean().item()
     
     return {
-        "eval_accuracy": accuracy,
+        "eval_probability_difference": probability_difference,
+        "eval_probability_difference_10": probability_difference_10,
         "model_edge_sparsity": model_edge_sparsity,
         "model_layer_sparsity": model_layer_sparsity,
         "target_edge_sparsity": target_edge_sparsity,
@@ -602,13 +507,13 @@ def main():
 
         # Construct sys.argv as if the script were run from the command line
         sys.argv = [
-            "src/prune/fpt2_ioi.py",  # Placeholder for script name
+            "src/prune/vit_imagenet.py",  # Placeholder for script name
             "--report_to", "wandb",
             "--do_train",
             "--do_eval",
-            "--dataset_path", "./data/datasets/ioi/",
+            "--dataset_path", "./data/datasets/gt/",
             "--train_split", train_split,
-            "--initialize_from", "gpt2",
+            "--initialize_from", "google/vit-base-patch16-224",
             "--max_seq_length", "64",
             "--per_device_train_batch_size", "2",
             "--per_device_eval_batch_size", "16",
@@ -633,7 +538,7 @@ def main():
             "--max_train_samples", str(N_TRAIN),
             "--max_eval_samples", str(N_VAL),
             "--output_dir",
-            f"./data/runs/ioi-{TAG}-elr{ELR}-llr{LLR}-relr{RELR}-rllr{RLLR}-es{0.94}-ns{NODE_SPARSITY}-t{TOTAL}/",
+            f"./data/runs/gt-{TAG}-elr{ELR}-llr{LLR}-relr{RELR}-rllr{RLLR}-es{0.94}-ns{NODE_SPARSITY}-t{TOTAL}/",
             "--remove_unused_columns", "false",
             "--dataloader_num_workers", "0",
             "--warmup_type", "linear",
@@ -696,22 +601,36 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
-
-    raw_datasets = load_datasets(data_args.dataset_path, data_args.max_train_samples, data_args.max_eval_samples, train_split=data_args.train_split)
+    imagenet_val = ImageNetDataset(root_dir='/data/nvme1/yxpeng/imagenet/val',
+                                   processor=AutoImageProcessor.from_pretrained("google/vit-base-patch16-224"))
+    train_size = int(0.8 * len(imagenet_val))
+    eval_size = len(imagenet_val) - train_size
+    train_dataset, eval_dataset = random_split(imagenet_val, [train_size, eval_size])
+    raw_datasets = {'train': train_dataset, 'validation': eval_dataset}
     n_train = len(raw_datasets["train"])
-    
-    model = FPT2LMHeadModel.from_pretrained(
+    vit_model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
+    state_dict = vit_model.state_dict()
+    new_state_dict = {}
+    for old_key, value in state_dict.items():
+        if "vit.encoder.layer" in old_key:
+            new_key = old_key.replace("vit.encoder.layer", "vit.encoder")
+            new_state_dict[new_key] = value
+        else:
+            new_state_dict[old_key] = value
+    model = ViTHeadModel.from_pretrained(
         model_args.initialize_from,
+        state_dict=new_state_dict,
         with_embedding_nodes=data_args.with_embedding_nodes,
         disable_linear_regularization_term=data_args.disable_linear_reg_term,
     )
-    gpt2_model = FPT2LMHeadModel.from_pretrained(
-        "gpt2",
+    gpt2_model = ViTHeadModel.from_pretrained(
+        model_args.initialize_from,
+        state_dict=new_state_dict,
         with_embedding_nodes=data_args.with_embedding_nodes,
     ).to("cuda")
     
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    # tokenizer.pad_token = tokenizer.eos_token
     
     freeze_all_except_pruning_params(model)
 
@@ -721,14 +640,13 @@ def main():
         train_dataset = raw_datasets["train"]
 
     if training_args.do_eval:
+        # We don't have a validation dataset, so we'll just use the test dataset.
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = raw_datasets["validation"]
 
     # Data collator
-    collator = DataCollatorIOI(
-        tokenizer=tokenizer,
-        max_length=data_args.max_seq_length
+    collator = DataCollator(
     )
     
     optimizers = get_optimizers(
@@ -743,8 +661,9 @@ def main():
     )
 
     # Initialize our Trainer
-    trainer = FPT2InfoTrainer(
+    trainer = ImageClassifierTrainer(
         model=model,
+        # tokenizer=tokenizer,
         gpt2_model=gpt2_model,
         data_collator=collator,
         args=training_args,

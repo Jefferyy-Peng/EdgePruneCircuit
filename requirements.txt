@@ -1,5 +1,6 @@
 absl-py==2.1.0
-accelerate==0.28.0
+accelerate
+tracr @ git+https://github.com/deepmind/tracr
 aiohttp==3.9.3
 aiosignal==1.3.1
 alembic==1.13.1
@@ -39,13 +40,13 @@ cloudpickle==3.0.0
 cmake==3.25.0
 coloredlogs==15.0.1
 colorspacious==1.1.2
-composer==0.16.3
+composer
 contourpy==1.2.0
 coolname==2.2.0
 cramjam==2.8.3
 cryptography==42.0.5
 cycler==0.12.1
-datasets==2.14.7
+datasets
 decorator==5.1.1
 deepspeed==0.14.0
 defusedxml==0.7.1
@@ -113,7 +114,7 @@ jupyterlab_pygments==0.3.0
 kiwisolver==1.4.5
 lightning-utilities==0.11.2
 lit==15.0.7
-llm-foundry==0.3.0
+llm-foundry
 Mako==1.3.2
 Markdown==3.6
 markdown-it-py==3.0.0
@@ -123,10 +124,10 @@ matplotlib-inline==0.1.7
 mdurl==0.1.2
 mistune==3.0.2
 ml-dtypes==0.4.0
-mlflow==2.11.3
-mosaicml==0.16.4
-mosaicml-cli==0.5.34
-mosaicml-streaming==0.6.1
+mlflow
+mosaicml
+mosaicml-cli
+mosaicml-streaming
 mpmath==1.3.0
 msal==1.28.0
 msal-extensions==1.1.0
@@ -139,7 +140,7 @@ nbformat==5.10.4
 nest-asyncio==1.6.0
 networkx==3.2.1
 ninja==1.11.1.1
-numpy==1.26.3
+numpy
 nvidia-cublas-cu12==12.1.3.1
 nvidia-cuda-cupti-cu12==12.1.105
 nvidia-cuda-nvrtc-cu12==12.1.105
@@ -154,8 +155,8 @@ nvidia-nvjitlink-cu12==12.4.99
 nvidia-nvtx-cu12==12.1.105
 oci==2.125.0
 omegaconf==2.3.0
-onnx==1.14.0
-onnxruntime==1.15.1
+onnx
+onnxruntime
 openai==1.21.1
 opt-einsum==3.3.0
 optax==0.2.2
@@ -165,10 +166,10 @@ pandas==2.2.1
 pandocfilters==1.5.1
 paramiko==3.4.0
 parso==0.8.4
-pathtools==0.1.2
+pathtools
 pexpect==4.9.0
 pickleshare==0.7.5
-pillow==10.2.0
+pillow
 pipreqs==0.5.0
 platformdirs==4.2.2
 portalocker==2.8.2
@@ -210,9 +211,9 @@ rsa==4.9
 ruamel.yaml==0.18.6
 ruamel.yaml.clib==0.2.8
 s3transfer==0.10.1
-safetensors==0.4.2
-scikit-learn==1.4.1.post1
-scipy==1.12.0
+safetensors
+scikit-learn
+scipy
 seaborn==0.13.2
 sentencepiece==0.1.97
 sentry-sdk==1.44.0
@@ -235,16 +236,15 @@ threadpoolctl==3.4.0
 tinycss2==1.3.0
 tokenizers==0.15.2
 toolz==0.12.1
-torch==2.1.0
+torch
 torch-optimizer==0.3.0
-torchaudio==2.0.2+cu118
-torchmetrics==1.0.3
-torchvision==0.16.0
+torchaudio
+torchmetrics
+torchvision
 tornado==6.4.1
 tqdm==4.66.2
-tracr @ file:///scratch/gpfs/ab4197/p-printer/tracr/tracr
 traitlets==5.14.3
-transformers @ git+https://github.com/huggingface/transformers@3b8e2932ce743008f63585aae1e1b8b30dc8b3ac
+transformers
 triton==2.1.0
 typer==0.12.0
 typer-cli==0.12.0

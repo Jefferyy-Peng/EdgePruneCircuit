@@ -66,7 +66,7 @@ sys.path.append(
         "src/modeling/"
     )
 )   # Very hacky but the imports are annoying otherwise
-from modeling_fpt2 import FPT2LMHeadModel
+from src.modeling.modeling_fpt2 import FPT2LMHeadModel
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 logger = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ class FPT2InfoTrainer(Seq2SeqTrainer):
         else:
             return self.target_layer_sparsity
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if self.digits is None:
             self.digits = torch.LongTensor([self.tokenizer.encode("{:02d}".format(i))[0] for i in range(100)]).to(self.args.device)
 
@@ -512,6 +512,68 @@ def main():
         # let's parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
+        NODE_SPARSITY = 0.72
+        ELR = 0.8
+        LLR = 0.8
+        RELR = 0.8
+        RLLR = 0.8
+        TOTAL = 3000
+        WARMUP = 2500
+
+        EXTRA = "--disable_node_loss"
+        TAG = "wo_node_loss"
+
+        # Uncomment this if you want to run with node loss
+        # EXTRA = ""
+        # TAG = "w_node_loss"
+
+        train_split = "train"  # "train_400", "train_100k"
+        N_TRAIN = 1000000  # Set to a large value so all of the (200 / 400 / 100000) examples are used
+        N_VAL = 200  # The val split size
+
+        # Construct sys.argv as if the script were run from the command line
+        sys.argv = [
+            "src/prune/fpt2_ioi.py",  # Placeholder for script name
+            "--report_to", "wandb",
+            "--do_train",
+            "--do_eval",
+            "--dataset_path", "./data/datasets/gt/",
+            "--train_split", train_split,
+            "--initialize_from", "gpt2",
+            "--max_seq_length", "64",
+            "--per_device_train_batch_size", "2",
+            "--per_device_eval_batch_size", "16",
+            "--gradient_accumulation_steps", "1",
+            "--eval_accumulation_steps", "16",
+            "--edge_learning_rate", str(ELR),
+            "--layer_learning_rate", str(LLR),
+            "--reg_edge_learning_rate", str(RELR),
+            "--reg_layer_learning_rate", str(RLLR),
+            "--max_steps", str(TOTAL),
+            "--warmup_steps", "200",
+            "--evaluation_strategy", "steps",
+            "--eval_steps", "64",
+            "--save_steps", "64",
+            "--logging_steps", "8",
+            "--save_total_limit", "1",
+            "--start_edge_sparsity", "0.00",
+            "--target_edge_sparsity", str(0.94),
+            "--start_layer_sparsity", "0.00",
+            "--target_layer_sparsity", str(NODE_SPARSITY),
+            "--num_sparsity_warmup_steps", str(WARMUP),
+            "--max_train_samples", str(N_TRAIN),
+            "--max_eval_samples", str(N_VAL),
+            "--output_dir",
+            f"./data/runs/gt-{TAG}-elr{ELR}-llr{LLR}-relr{RELR}-rllr{RLLR}-es{0.94}-ns{NODE_SPARSITY}-t{TOTAL}/",
+            "--remove_unused_columns", "false",
+            "--dataloader_num_workers", "0",
+            "--warmup_type", "linear",
+            "--with_embedding_nodes"
+        ]
+
+        # Add EXTRA arguments if provided
+        if EXTRA:
+            sys.argv.extend(EXTRA.split())
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     if model_args.use_auth_token is not None:

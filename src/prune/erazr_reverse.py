@@ -61,7 +61,7 @@ sys.path.append(
         "src/modeling/"
     )
 )
-from modeling_erazr import ErazrModelForSequenceTransformation, ErazrTokenizer, ErazrConfig, get_config_weights_and_vocab
+from src.modeling.modeling_erazr import ErazrModelForSequenceTransformation, ErazrTokenizer, ErazrConfig, get_config_weights_and_vocab
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 logger = logging.getLogger(__name__)
@@ -473,7 +473,56 @@ def main():
         # let's parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        EDGE_SPARSITY = 1.02
+        NODE_SPARSITY = 0.1
+        ELR = 0.03
+        LLR = 0.03
+        RELR = 0.001
+        RLLR = 0.001
+        TOTAL = 6000
+        WARMUP = 5900
+
+        sys.argv = [
+            "src/prune/erazr_reverse.py",  # Placeholder for script name
+            "--report_to", "wandb",
+            "--do_train",
+            "--do_eval",
+            "--dataset_path", "./data/datasets/reverse-t3-s3",
+            "--initialize_from", "./data/tracr_models/reverse.tracr.pkl",
+            "--seq_length", "4",
+            "--per_device_train_batch_size", "16",
+            "--per_device_eval_batch_size", "16",
+            "--gradient_accumulation_steps", "1",
+            "--eval_accumulation_steps", "16",
+            "--edge_learning_rate", str(ELR),
+            "--layer_learning_rate", str(LLR),
+            "--reg_edge_learning_rate", str(RELR),
+            "--reg_layer_learning_rate", str(RLLR),
+            "--max_steps", str(TOTAL),
+            "--warmup_steps", "1500",
+            "--evaluation_strategy", "steps",
+            "--eval_steps", "64",
+            "--save_steps", "64",
+            "--logging_steps", "4",
+            "--save_total_limit", "1",
+            "--start_edge_sparsity", "0.00",
+            "--target_edge_sparsity", str(EDGE_SPARSITY),
+            "--start_layer_sparsity", "0.00",
+            "--target_layer_sparsity", str(NODE_SPARSITY),
+            "--num_sparsity_warmup_steps", str(WARMUP),
+            "--max_train_samples", str(100000),
+            "--max_eval_samples", str(100000),
+            "--output_dir",
+            f"./data/runs/erazr-reverse-elr${ELR}-llr${LLR}-relr${RELR}-rllr${RLLR}-es${EDGE_SPARSITY}-ns${NODE_SPARSITY}-t${TOTAL}/",
+            "--remove_unused_columns", "false",
+            "--dataloader_num_workers", "0",
+            "--label_names", "labels",
+            "--warmup_type", "linear",
+            "--zero_ablation",
+            "--disable_node_loss"
+            "--overwrite_output_dir"
+        ]
+        # model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     if model_args.use_auth_token is not None:
         warnings.warn(
