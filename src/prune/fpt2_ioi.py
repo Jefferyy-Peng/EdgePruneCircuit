@@ -124,7 +124,7 @@ class FPT2InfoTrainer(Seq2SeqTrainer):
         else:
             return self.target_layer_sparsity
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         start_idxes = inputs.pop("start_idxes")
         end_idxes = inputs.pop("end_idxes")
         _ = inputs.pop("labels")
@@ -145,8 +145,8 @@ class FPT2InfoTrainer(Seq2SeqTrainer):
             ).writer_states
 
             # Reshape corr_x in case we have distributed training
-            tgt_shape = (-1, bsz // self.device_count, *corr_x.shape[2:])
-            corr_x = corr_x.reshape(tgt_shape)
+            # tgt_shape = (-1, bsz // self.device_count, *corr_x.shape[2:])
+            # corr_x = corr_x.reshape(tgt_shape)
         
         outputs = model(
             input_ids=input_ids,
