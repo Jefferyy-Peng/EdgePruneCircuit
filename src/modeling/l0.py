@@ -22,6 +22,11 @@ def sample_z_from_u(u, log_alpha):
 
 def deterministic_z_from_log_alpha(log_alpha, apply_one=False):
     size = np.prod(log_alpha.shape)
+    # if not torch.isfinite(log_alpha).all():
+    #     print("Non-finite log_alpha detected!")
+    #     print("log_alpha min:", log_alpha.min().item())
+    #     print("log_alpha max:", log_alpha.max().item())
+    #     raise ValueError("log_alpha contains NaN or Inf")
     
     # Since the distribution is stretched to [-eps, 1+eps], the prob of a variable <= 0 equals its prob to 0
     expected_num_nonzeros = torch.sum(1 - cdf_stretched_concrete(0, log_alpha))

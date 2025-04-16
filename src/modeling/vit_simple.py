@@ -17,7 +17,6 @@
 import collections
 import math
 import os
-import pickle
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union, Set
@@ -26,12 +25,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from accelerate import Accelerator
 from torch import nn
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from torch.utils.data import random_split, DataLoader
-from torchvision.transforms import transforms
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
@@ -52,8 +49,6 @@ from tqdm import tqdm
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 from transformers.models.vit.configuration_vit import ViTConfig
 import sys
-
-
 sys.path.append(
     os.path.join(
         os.getcwd(),
@@ -61,8 +56,6 @@ sys.path.append(
     )
 )   # Very hacky but the imports are annoying otherwise
 
-from custom_datasets import ColoredMNIST
-from modeling.vit_simple import ViTModelSimple
 from modeling.l0 import deterministic_z_from_log_alpha, sample_z_from_log_alpha
 from utils import ImageNetDataset
 
@@ -112,22 +105,18 @@ def writer_name_to_idx(name, num_layers, num_heads, with_embedding_nodes=False):
 
 
 def reader_idx_to_name(reader_idx, num_layers, num_heads):
-    layer_idx = reader_idx // (3 * num_heads + 1)
-    head_idx = reader_idx % (3 * num_heads + 1)
+    layer_idx = reader_idx // (num_heads + 1)
+    head_idx = reader_idx % (num_heads + 1)
     if layer_idx == num_layers:
         return "resid_post"
 
     if head_idx < num_heads:
-        return f"a{layer_idx}.h{head_idx}.q"
-    elif head_idx < 2 * num_heads:
-        return f"a{layer_idx}.h{head_idx - num_heads}.k"
-    elif head_idx < 3 * num_heads:
-        return f"a{layer_idx}.h{head_idx - 2 * num_heads}.v"
+        return f"a{layer_idx}.h{head_idx}"
     else:
         return f"m{layer_idx}"
 
 
-def get_mask(log_alpha, training=False, threshold_for_deterministic=None, apply_one=False, reverse=False, close_all=False):
+def get_mask(log_alpha, training=False, threshold_for_deterministic=None, apply_one=False, reverse=False, close_all=False, is_read=False):
     if training:
         mask = sample_z_from_log_alpha(log_alpha)
     else:
@@ -212,7 +201,7 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
 
 def get_num_readers(config):
     # The number of readers does not depend on whether the model has embedding nodes
-    n_readers = config.num_hidden_layers * (3 * config.num_attention_heads + 1) + 1  # Q/K/V + MLP for each layer + final read
+    n_readers = config.num_hidden_layers * (config.num_attention_heads + 1) + 1  # Q/K/V + MLP for each layer + final read
     return n_readers
 
 
@@ -226,10 +215,10 @@ def get_num_writers(config, with_embedding_nodes=False):
 def get_num_edges(config, with_embedding_nodes=False):
     n_edges = 0
     embedding_nodes = 2 if with_embedding_nodes else 0
-    for l in range(config.num_attention_heads):
+    for l in range(config.num_hidden_layers):
         # The attention heads' Q/K/V will read from heads + mlp of all previous layers + any embeddings
         contribution = embedding_nodes + l * (config.num_attention_heads + 1)
-        n_edges += 3 * config.num_attention_heads * contribution
+        n_edges += config.num_attention_heads * contribution
         # The MLP reads all the above + the output of this layer's heads
         n_edges += contribution + config.num_attention_heads
     # The final layer reads from all writers
@@ -244,7 +233,7 @@ def get_num_nodes(config, with_embedding_nodes=False):
 
 def get_base_indices_for_layer(config, l, with_embedding_nodes=False):
     writer_offset = 2 if with_embedding_nodes else 0
-    reader_idx = l * (3 * config.num_attention_heads + 1)
+    reader_idx = l * (config.num_attention_heads + 1)
     writer_idx = writer_offset + l * (config.num_attention_heads + 1)
     return reader_idx, writer_idx
 
@@ -397,27 +386,27 @@ class ViTSelfAttention(nn.Module):
         return x.permute(0, 1, 3, 2, 4)
 
     def forward(
-        self, q_hidden_states, k_hidden_states, v_hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
+        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
         query_weight = self.query.weight.T.reshape(self.config.hidden_size, self.config.num_attention_heads, -1).permute(1, 0, 2)
         query_bias = self.query.bias.reshape(1, self.config.num_attention_heads, 1, -1)
         query_layer = torch.einsum(
             "nbld,ndh->bnlh",
-            q_hidden_states,
+            hidden_states,
             query_weight
         ) + query_bias
         key_weight = self.key.weight.T.reshape(self.config.hidden_size, self.config.num_attention_heads, -1).permute(1, 0, 2)
         key_bias = self.key.bias.reshape(1, self.config.num_attention_heads, 1, -1)
         key_layer = torch.einsum(
             "nbld,ndh->bnlh",
-            k_hidden_states,
+            hidden_states,
             key_weight
         ) + key_bias
         value_weight = self.value.weight.T.reshape(self.config.hidden_size, self.config.num_attention_heads, -1).permute(1, 0, 2)
         value_bias = self.value.bias.reshape(1, self.config.num_attention_heads, 1, -1)
         value_layer = torch.einsum(
             "nbld,ndh->bnlh",
-            v_hidden_states,
+            hidden_states,
             value_weight
         ) + value_bias
 
@@ -500,15 +489,13 @@ class ViTAttention(nn.Module):
 
     def forward(
         self,
-        q_hidden_states: torch.Tensor,
-        k_hidden_states: torch.Tensor,
-        v_hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: bool = False,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
-        self_outputs, query, key, value = self.attention(q_hidden_states, k_hidden_states, v_hidden_states, head_mask, output_attentions)
+        self_outputs, query, key, value = self.attention(hidden_states, head_mask, output_attentions)
 
         if use_cache is True:
             present = (key, value)
@@ -582,19 +569,15 @@ class ViTBlock(nn.Module):
 
         reader_offset, writer_offset = get_base_indices_for_layer(config, layer_idx, with_embedding_nodes)
         self.attn_reader_offset = reader_offset
-        self.mlp_reader_offset = reader_offset + 3 * config.num_attention_heads
+        self.mlp_reader_offset = reader_offset + config.num_attention_heads
         self.attn_writer_offset = writer_offset
         self.mlp_writer_offset = writer_offset + config.num_attention_heads
         self.edge_threshold_for_deterministic = None
         self.node_threshold_for_deterministic = None
 
-        self.q_read_log_alphas = nn.Parameter(torch.empty(self.n_writers, self.n_head, dtype=self._dtype))
-        self.k_read_log_alphas = nn.Parameter(torch.empty(self.n_writers, self.n_head, dtype=self._dtype))
-        self.v_read_log_alphas = nn.Parameter(torch.empty(self.n_writers, self.n_head, dtype=self._dtype))
+        self.attn_read_log_alphas = nn.Parameter(torch.empty(self.n_writers, self.n_head, dtype=self._dtype))
         self.mlp_read_log_alphas = nn.Parameter(torch.empty(self.n_writers, dtype=self._dtype))
-        self.q_read_log_alphas.data.normal_(mean=10.0, std=0.01)
-        self.k_read_log_alphas.data.normal_(mean=10.0, std=0.01)
-        self.v_read_log_alphas.data.normal_(mean=10.0, std=0.01)
+        self.attn_read_log_alphas.data.normal_(mean=10.0, std=0.01)
         self.mlp_read_log_alphas.data.normal_(mean=10.0, std=0.01)
 
         self.attn_write_log_alphas = nn.Parameter(torch.empty(self.n_head))
@@ -631,9 +614,7 @@ class ViTBlock(nn.Module):
 
     @torch.no_grad()
     def reset_all_log_alphas(self):
-        self.q_read_log_alphas.data.normal_(mean=10.0, std=0.01)
-        self.k_read_log_alphas.data.normal_(mean=10.0, std=0.01)
-        self.v_read_log_alphas.data.normal_(mean=10.0, std=0.01)
+        self.attn_read_log_alphas.data.normal_(mean=10.0, std=0.01)
         self.attn_write_log_alphas.data.normal_(mean=10.0, std=0.01)
         self.mlp_read_log_alphas.data.normal_(mean=10.0, std=0.01)
         self.mlp_write_log_alphas.data.normal_(mean=10.0, std=0.01)
@@ -643,37 +624,25 @@ class ViTBlock(nn.Module):
         # corr_x, if it exists, is (writers, batch_size, sequence_length, hidden_size)
         # embeds, if it exists, is (batch_size, sequence_length, hidden_size)
 
-        q_m = get_mask(self.q_read_log_alphas, training=self.training,
-                       threshold_for_deterministic=self.edge_threshold_for_deterministic, reverse=reverse, close_all=close_all)
-        k_m = get_mask(self.k_read_log_alphas, training=self.training,
-                       threshold_for_deterministic=self.edge_threshold_for_deterministic, reverse=reverse, close_all=close_all)
-        v_m = get_mask(self.v_read_log_alphas, training=self.training,
-                       threshold_for_deterministic=self.edge_threshold_for_deterministic, reverse=reverse, close_all=close_all)
+        x_m = get_mask(self.attn_read_log_alphas, training=self.training,
+                       threshold_for_deterministic=self.edge_threshold_for_deterministic, reverse=reverse, close_all=close_all, is_read=True)
 
         # mask the component this node is reading from
-        q_z = q_m * self.attn_read_common_mask
-        k_z = k_m * self.attn_read_common_mask
-        v_z = v_m * self.attn_read_common_mask
+        x_z = x_m * self.attn_read_common_mask
 
         # sum over all node that is being read from
-        x_q = torch.einsum("wbsd,wh->hbsd", x, q_z)
-        x_k = torch.einsum("wbsd,wh->hbsd", x, k_z)
-        x_v = torch.einsum("wbsd,wh->hbsd", x, v_z)
+        x = torch.einsum("wbsd,wh->hbsd", x, x_z)
 
         if embeds is not None:
-            x_q = x_q + embeds.unsqueeze(0)
-            x_k = x_k + embeds.unsqueeze(0)
-            x_v = x_v + embeds.unsqueeze(0)
+            x = x + embeds.unsqueeze(0)
 
         if corr_x is not None:
             # mix with the corrupted activation at the node and controled by q_m
-            x_q = x_q + torch.einsum("wbsd,wh->hbsd", corr_x, (1 - q_m) * self.attn_read_common_mask)
-            x_k = x_k + torch.einsum("wbsd,wh->hbsd", corr_x, (1 - k_m) * self.attn_read_common_mask)
-            x_v = x_v + torch.einsum("wbsd,wh->hbsd", corr_x, (1 - v_m) * self.attn_read_common_mask)
+            x = x + torch.einsum("wbsd,wh->hbsd", corr_x, (1 - x_m) * self.attn_read_common_mask)
 
-        z_edges_sum = torch.sum(q_z) + torch.sum(k_z) + torch.sum(v_z)
+        z_edges_sum = torch.sum(x_z)
 
-        return x_q, x_k, x_v, z_edges_sum
+        return x, z_edges_sum
 
     def attn_write(self, residual, x, corr_x=None, reverse=False, close_all=False):
         # residual is (writers, batch_size, sequence_length, hidden_size)
@@ -703,7 +672,7 @@ class ViTBlock(nn.Module):
         # corr_x, if it exists, is (writers, batch_size, sequence_length, hidden_size)
         # embeds, if it exists, is (batch_size, sequence_length, hidden_size)
         m = get_mask(self.mlp_read_log_alphas, training=self.training,
-                     threshold_for_deterministic=self.edge_threshold_for_deterministic, reverse=reverse, close_all=close_all)
+                     threshold_for_deterministic=self.edge_threshold_for_deterministic, reverse=reverse, close_all=close_all, is_read=True)
 
         z = m * self.mlp_read_common_mask
         x_z = torch.einsum("wbsd,w->bsd", x, z)
@@ -740,24 +709,12 @@ class ViTBlock(nn.Module):
 
     @torch.no_grad()
     def get_edge_masks(self):
-        z_q = get_mask(
-            self.q_read_log_alphas,
+        z_attn = get_mask(
+            self.attn_read_log_alphas,
             training=self.training,
             threshold_for_deterministic=self.edge_threshold_for_deterministic
         )
-        z_q = z_q[:self.attn_writer_offset, :]
-        z_k = get_mask(
-            self.k_read_log_alphas,
-            training=self.training,
-            threshold_for_deterministic=self.edge_threshold_for_deterministic
-        )
-        z_k = z_k[:self.attn_writer_offset, :]
-        z_v = get_mask(
-            self.v_read_log_alphas,
-            training=self.training,
-            threshold_for_deterministic=self.edge_threshold_for_deterministic
-        )
-        z_v = z_v[:self.attn_writer_offset, :]
+        z_attn = z_attn[:self.attn_writer_offset, :]
 
         z_mlp = get_mask(
             self.mlp_read_log_alphas,
@@ -766,7 +723,7 @@ class ViTBlock(nn.Module):
         )
         z_mlp = z_mlp[:self.mlp_writer_offset]
 
-        return (z_q, z_k, z_v, z_mlp)
+        return (z_attn, z_mlp)
 
     @torch.no_grad()
     def get_node_masks(self):
@@ -785,24 +742,28 @@ class ViTBlock(nn.Module):
         return (z_attn, z_mlp)
 
     @torch.no_grad()
-    def set_attn_mask_value(self, from_idx, head_idx, qkv, value):
-        if qkv == "q":
-            old_value = self.q_read_log_alphas[from_idx, head_idx].detach().item()
-            self.q_read_log_alphas[from_idx, head_idx] = value
-        elif qkv == "k":
-            old_value = self.k_read_log_alphas[from_idx, head_idx].detach().item()
-            self.k_read_log_alphas[from_idx, head_idx] = value
-        elif qkv == "v":
-            old_value = self.v_read_log_alphas[from_idx, head_idx].detach().item()
-            self.v_read_log_alphas[from_idx, head_idx] = value
-        else:
-            raise ValueError(f"Unrecognized qkv {qkv}")
+    def set_attn_mask_value(self, from_idx, head_idx, value):
+        old_value = self.read_log_alphas[from_idx, head_idx].detach().item()
+        self.read_log_alphas[from_idx, head_idx] = value
+        return old_value
+
+    @torch.no_grad()
+    def set_all_attn_mask_value(self, values):
+        old_value = self.attn_read_log_alphas.detach()
+        if not len(values) == 0:
+            self.attn_read_log_alphas[:len(values), :] = values
         return old_value
 
     @torch.no_grad()
     def set_mlp_mask_value(self, from_idx, value):
         old_value = self.mlp_read_log_alphas[from_idx].detach().item()
         self.mlp_read_log_alphas[from_idx] = value
+        return old_value
+
+    @torch.no_grad()
+    def set_all_mlp_mask_value(self, values):
+        old_value = self.mlp_read_log_alphas.detach()
+        self.mlp_read_log_alphas[:len(values)] = values
         return old_value
 
     def forward(
@@ -820,7 +781,7 @@ class ViTBlock(nn.Module):
     ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
         residual = hidden_states
 
-        q_hidden_states, k_hidden_states, v_hidden_states, z_attn_edges_sum = self.attn_read(
+        read_hidden_states, z_attn_edges_sum = self.attn_read(
             hidden_states,
             embeds=embeds,
             corr_x=corr_x,
@@ -828,14 +789,10 @@ class ViTBlock(nn.Module):
             close_all=close_all
         )
 
-        q_hidden_states = self.layernorm_before(q_hidden_states)
-        k_hidden_states = self.layernorm_before(k_hidden_states)
-        v_hidden_states = self.layernorm_before(v_hidden_states)
+        read_hidden_states = self.layernorm_before(read_hidden_states)
 
         attn_outputs = self.attention(
-            q_hidden_states,
-            k_hidden_states,
-            v_hidden_states,
+            read_hidden_states,
             head_mask=head_mask,
             attention_mask=attention_mask,
             use_cache=use_cache,
@@ -976,7 +933,7 @@ class ViTModelOutput(ModelOutput):
     node_loss: Optional[torch.FloatTensor] = None
 
 
-class ViTModel(ViTPreTrainedModel):
+class ViTModelSimple(ViTPreTrainedModel):
     def __init__(
             self,
             config,
@@ -1107,7 +1064,7 @@ class ViTModel(ViTPreTrainedModel):
 
         s, n = 0, 0
         for l in range(self.n_layer):
-            for i in range(4):
+            for i in range(2):
                 s_, n_ = process(edge_masks[l][i])
                 s += s_
                 n += n_
@@ -1144,6 +1101,41 @@ class ViTModel(ViTPreTrainedModel):
         return 1 - s
 
     @torch.no_grad()
+    def set_effective_edge_mask(self, reverse=False):
+        edge_masks = self.get_effective_edge_mask(reverse)
+        node_masks = self.get_node_masks()
+        node_masks = [(torch.ones_like(attn_node_mask), torch.ones_like(mlp_node_mask)) for (attn_node_mask, mlp_node_mask) in node_masks]
+
+        for idx, (attn_edge, mlp_edge) in enumerate(edge_masks[:len(edge_masks) - 1]):
+            old_attn_value = self.encoder[idx].set_all_attn_mask_value(attn_edge * 20 - 10)
+            old_mlp_value = self.encoder[idx].set_all_mlp_mask_value(mlp_edge * 20 - 10)
+        last_layer_edge = edge_masks[-1][0]
+        self.final_read_log_alphas = nn.Parameter(last_layer_edge * 20 - 10)
+
+        for idx, (attn_node, mlp_node) in enumerate(node_masks):
+            self.encoder[idx].attn_write_log_alphas = nn.Parameter(attn_node * 20 - 10)
+            self.encoder[idx].mlp_write_log_alphas = nn.Parameter(mlp_node * 20 - 10)
+
+    @torch.no_grad()
+    def get_effective_edge_mask(self, reverse=False):
+        edge_masks = self.get_edge_masks()
+        node_masks = self.get_node_masks()
+
+        full_node_mask = torch.cat([mask.reshape(-1) for group in node_masks for mask in group], dim=0)
+
+        def process(mask, reverse):
+            mask = mask * full_node_mask[:mask.shape[0]].reshape(-1, *([1] * (mask.ndim - 1)))
+            if reverse:
+                mask = 1 - mask
+            return mask
+
+        effective_masks = []
+        for l in range(self.n_layer):
+            effective_masks.append((process(edge_masks[l][0], reverse), process(edge_masks[l][1], reverse)))
+
+        effective_masks.append((process(edge_masks[-1][0], reverse), ))
+        return effective_masks
+    @torch.no_grad()
     def get_effective_edge_sparsity(self):
         edge_masks = self.get_edge_masks()
         node_masks = self.get_node_masks()
@@ -1156,7 +1148,7 @@ class ViTModel(ViTPreTrainedModel):
 
         s, n = 0, 0
         for l in range(self.n_layer):
-            for i in range(4):
+            for i in range(2):
                 s_, n_ = process(edge_masks[l][i])
                 s += s_
                 n += n_
@@ -1196,29 +1188,13 @@ class ViTModel(ViTPreTrainedModel):
             if mlp_writers == 1:
                 allowed_writers.append(offset + (l + 1) * (1 + self.n_head) - 1)
 
-            attn_q_edges, attn_k_edges, attn_v_edges, mlp_edges = edge_masks[l]
-            for from_idx in range(attn_q_edges.shape[0]):
+            attn_edges, mlp_edges = edge_masks[l]
+            for from_idx in range(attn_edges.shape[0]):
                 if from_idx not in allowed_writers:
                     continue
-                for head_no in range(attn_q_edges.shape[1]):
-                    if attn_q_edges[from_idx, head_no] == 1:
-                        to_idx = l * (1 + 3 * self.n_head) + head_no
-                        edges.append((
-                            writer_idx_to_name(from_idx, num_layers=self.n_layer, num_heads=self.n_head,
-                                               with_embedding_nodes=self.with_embedding_nodes),
-                            reader_idx_to_name(to_idx, num_layers=self.n_layer, num_heads=self.n_head)
-                        ))
-                for head_no in range(attn_k_edges.shape[1]):
-                    if attn_k_edges[from_idx, head_no] == 1:
-                        to_idx = l * (1 + 3 * self.n_head) + self.n_head + head_no
-                        edges.append((
-                            writer_idx_to_name(from_idx, num_layers=self.n_layer, num_heads=self.n_head,
-                                               with_embedding_nodes=self.with_embedding_nodes),
-                            reader_idx_to_name(to_idx, num_layers=self.n_layer, num_heads=self.n_head)
-                        ))
-                for head_no in range(attn_v_edges.shape[1]):
-                    if attn_v_edges[from_idx, head_no] == 1:
-                        to_idx = l * (1 + 3 * self.n_head) + 2 * self.n_head + head_no
+                for head_no in range(attn_edges.shape[1]):
+                    if attn_edges[from_idx, head_no] == 1:
+                        to_idx = l * (1 + self.n_head) + head_no
                         edges.append((
                             writer_idx_to_name(from_idx, num_layers=self.n_layer, num_heads=self.n_head,
                                                with_embedding_nodes=self.with_embedding_nodes),
@@ -1228,7 +1204,7 @@ class ViTModel(ViTPreTrainedModel):
                 if from_idx not in allowed_writers:
                     continue
                 if mlp_edges[from_idx] == 1:
-                    to_idx = (l + 1) * (1 + 3 * self.n_head) - 1
+                    to_idx = (l + 1) * (1 + self.n_head) - 1
                     edges.append((
                         writer_idx_to_name(from_idx, num_layers=self.n_layer, num_heads=self.n_head,
                                            with_embedding_nodes=self.with_embedding_nodes),
@@ -1339,7 +1315,7 @@ class ViTModel(ViTPreTrainedModel):
         # corr_x, if it exists, is (writers, batch_size, sequence_length, hidden_size)
         # embeds, if it exists, is (batch_size, sequence_length, hidden_size)
         z = get_mask(self.final_read_log_alphas, training=self.training,
-                     threshold_for_deterministic=self.edge_threshold_for_deterministic, reverse=reverse, close_all=close_all)
+                     threshold_for_deterministic=self.edge_threshold_for_deterministic, reverse=reverse, close_all=close_all, is_read=True)
         x_z = torch.einsum("wbsd,w->bsd", x, z)
 
         if embeds is not None:
@@ -1666,13 +1642,10 @@ class ViTHeadModel(ViTPreTrainedModel):
             self,
             config,
             with_embedding_nodes=False,
-            include_qkv=True,
             disable_linear_regularization_term=False,
-            state_dict=None,
     ):
         super().__init__(config)
-        model_cls = ViTModel if include_qkv else ViTModelSimple
-        self.vit = model_cls(
+        self.vit = ViTModel(
             config,
             with_embedding_nodes=with_embedding_nodes,
             disable_linear_regularization_term=disable_linear_regularization_term,
@@ -1685,10 +1658,6 @@ class ViTHeadModel(ViTPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
-        if state_dict:
-            ori_state_dict = self.state_dict()
-            ori_state_dict.update(state_dict)
-            self.load_state_dict(ori_state_dict)
 
     def parallelize(self, device_map=None):
         warnings.warn(
@@ -1751,10 +1720,6 @@ class ViTHeadModel(ViTPreTrainedModel):
         return self.vit.get_effective_edge_sparsity()
 
     @torch.no_grad()
-    def set_effective_edge_mask(self, reverse=False):
-        return self.vit.set_effective_edge_mask(reverse=reverse)
-
-    @torch.no_grad()
     def get_edges(self):
         return self.vit.get_edges()
 
@@ -1804,7 +1769,6 @@ class ViTHeadModel(ViTPreTrainedModel):
             target_node_sparsity=target_node_sparsity,
             corr_x=corr_x,
             output_writer_states=output_writer_states,
-            **kwargs,
         )
         hidden_states = transformer_outputs[0]
 
@@ -1820,8 +1784,8 @@ class ViTHeadModel(ViTPreTrainedModel):
             # move labels to correct device to enable model parallelism
             labels = labels.to(logits.device)
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss() if logits.shape[-1] > 1 else F.binary_cross_entropy_with_logits
-            loss = loss_fct(logits if logits.shape[-1] > 1 else logits.flatten(), labels if logits.shape[-1] > 1 else labels.float())
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits, labels)
 
         if not return_dict:
             output = (logits,) + transformer_outputs[1:]
@@ -1953,154 +1917,7 @@ def compute_mean():
     with open("mean_imagenet_val.pkl", "wb") as f:  # "wb" = write binary
         pickle.dump(activation, f)
 
-def compute_mean_mnist():
-    set_seed(1)
-    split = 'all_train_unbiased'
-    ft_method = 'DRO'
-    model_acc = '92.125'
-    mnist_version = 'new'
-    if mnist_version == 'new':
-        dataset_dir = '/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/new_data'
-    else:
-        dataset_dir = '/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/data'
-    dataset = ColoredMNIST(root=dataset_dir, env=split,
-                           transform=transforms.Compose([
-                               transforms.ToTensor(),
-                               transforms.Normalize((0.1307, 0.1307, 0.), (0.3081, 0.3081, 0.3081))
-                           ]))
-    # Create DataLoader
-    batch_size = 16  # Adjust as needed
-    val_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    vit_config = ViTConfig(image_size=28, patch_size=7, num_hidden_layers=2, num_attention_heads=4,
-                           intermediate_size=256 * 3,
-                           num_channels=3, num_labels=1)
-    if ft_method == 'ERM':
-        vit_ckpt = f'/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/checkpoints/vit_erm/ViT_coloredmnist_erm_test_{model_acc}.pt'
-    elif ft_method == 'IRM':
-        vit_ckpt = f'/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/checkpoints/vit_irm_new/ViT_coloredmnist_irm_test_{model_acc}.pt'
-    elif ft_method == 'DRO':
-        vit_ckpt = f'/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/checkpoints/vit_dro_new/ViT_coloredmnist_dro_test_{model_acc}.pt'
-    state_dict = torch.load(vit_ckpt)
-    new_state_dict = {}
-    for old_key, value in state_dict.items():
-        if "vit.encoder.layer" in old_key:
-            new_key = old_key.replace("vit.encoder.layer", "vit.encoder")
-            new_state_dict[new_key] = value
-        else:
-            new_state_dict[old_key] = value
-    gpt2_model = ViTHeadModel(
-        config=vit_config,
-        state_dict=new_state_dict,
-        include_qkv=False,
-        with_embedding_nodes=False,
-        disable_linear_regularization_term=False,
-    ).to('cuda').eval()
-    gpt2_model.set_edge_threshold_for_deterministic(0.5)
-    gpt2_model.set_node_threshold_for_deterministic(0.5)
-    activation = None
-    logit = 0
-    with torch.no_grad():
-        i = 0
-        for batch in tqdm(val_loader):
-            images, labels = batch  # Assuming dataset returns (image, label)
-            images = images.to("cuda")
-            labels = labels.to("cuda")
-            output = gpt2_model(input_images=images, labels=labels, output_writer_states=True)
-            logit += output.logits.mean().item()
-            if activation == None:
-                activation = output.writer_states.sum(dim=1)
-            else:
-                activation += output.writer_states.sum(dim=1)
-            i += batch_size
-    activation = activation / i
-    import pickle
-    with open(f"activations/mean_{ft_method}_{model_acc}_{mnist_version}_colored_mnist_{split}.pkl", "wb") as f:  # "wb" = write binary
-        pickle.dump(activation.detach().cpu(), f)
-
-def accelerate_compute_class_mean():
-    accelerator = Accelerator()
-    set_seed(1)
-
-    vit_model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
-    state_dict = vit_model.state_dict()
-    new_state_dict = {}
-    for old_key, value in state_dict.items():
-        if "vit.encoder.layer" in old_key:
-            new_key = old_key.replace("vit.encoder.layer", "vit.encoder")
-            new_state_dict[new_key] = value
-        else:
-            new_state_dict[old_key] = value
-    gpt2_model = ViTHeadModel.from_pretrained(
-        'google/vit-base-patch16-224',
-        state_dict=new_state_dict,
-        with_embedding_nodes=False,
-    ).to("cuda").eval()
-
-    ft_method = 'google'
-    dataset_split = 'val'
-
-    gpt2_model.set_edge_threshold_for_deterministic(0.5)
-    gpt2_model.set_node_threshold_for_deterministic(0.5)
-    gpt2_model = accelerator.prepare(gpt2_model)
-
-    batch_size = 32
-
-    with torch.no_grad():
-        activation_dict = {}
-
-        for i in range(1000):
-            imagenet_val = ImageNetDataset(root_dir=f'/data/nvme1/yxpeng/imagenet/{dataset_split}',
-                                           processor=AutoImageProcessor.from_pretrained("google/vit-base-patch16-224"), select_class=i)
-            val_loader = DataLoader(imagenet_val, batch_size=batch_size, shuffle=False)
-            val_loader = accelerator.prepare(val_loader)
-
-            activation = None
-            if accelerator.is_main_process:
-                print(f'Generating activations for class {i}, number of samples: {len(imagenet_val)}')
-
-            val_loader = tqdm(val_loader) if accelerator.is_main_process else val_loader
-            for batch in val_loader:
-                images, labels = batch  # Assuming dataset returns (image, label)
-                images, labels = images.to(accelerator.device), labels.to(accelerator.device)
-
-                output_batch = gpt2_model(input_images=images, labels=labels, output_writer_states=True)
-                activation_batch = output_batch.writer_states
-
-                if activation is None:
-                    activation = activation_batch.sum(dim=1)
-                else:
-                    activation += activation_batch.sum(dim=1)
-            activation = activation.unsqueeze(0) # since gather concate the first dim
-            activation = accelerator.gather(activation)
-            activation = activation.sum(dim=0)
-            activation_dict[f'class_{i}'] = {'activations': activation.detach().cpu(), 'size': len(imagenet_val)}
-            accelerator.wait_for_everyone()
-
-    if accelerator.is_main_process:
-        with open(f"activations/sum_{ft_method}_clip_imagenet_{dataset_split}_class_split.pkl", "wb") as f:
-            pickle.dump(activation_dict, f)
-
-def combine_classes():
-    split = 'val'
-    activation_path = f'/data/nvme1/yxpeng/PycharmProjects/Edge-Pruning/activations/sum_google_clip_imagenet_{split}_class_split.pkl'
-    with open(activation_path, "rb") as f:  # "rb" = read binary
-        loaded_data = pickle.load(f)
-
-    sum_activation = torch.zeros((156,197,768))
-    num_samples = 0
-    for key, value in loaded_data.items():
-        sum_activation += value['activations']
-        num_samples += value['size']
-
-    mean_activation = sum_activation / num_samples
-    with open(f"activations/mean_google_clip_imagenet_{split}.pkl", "wb") as f:
-        pickle.dump(mean_activation, f)
-
 
 if __name__ == '__main__':
     # test()
-    # compute_mean()
-    # accelerate_compute_class_mean()
-    # combine_classes()
-    compute_mean_mnist()
+    compute_mean()

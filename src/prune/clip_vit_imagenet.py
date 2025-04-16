@@ -15,9 +15,11 @@
 # limitations under the License.
 """ Finetuning the library models for sequence classification on GLUE."""
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
+import sys, os
 
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 import logging
-import os
 import torch
 import pickle
 import random
@@ -25,13 +27,14 @@ import sys
 import json
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 from torch.utils.data import random_split, DataLoader, TensorDataset
 import datasets
 import evaluate
 import numpy as np
 from datasets import load_dataset, load_from_disk, Dataset, DatasetDict
-from transformers import AutoImageProcessor, ViTForImageClassification
+from torchvision.transforms import transforms
+from transformers import AutoImageProcessor, ViTForImageClassification, ViTConfig
 
 import transformers
 from transformers import (
@@ -60,7 +63,7 @@ from transformers.utils.versions import require_version
 import torch.nn as nn
 from torch.optim import AdamW
 
-import sys
+
 
 sys.path.append(
     os.path.join(
@@ -69,6 +72,12 @@ sys.path.append(
     )
 )   # Very hacky but the imports are annoying otherwise
 
+from utils import get_failure_list
+from custom_datasets import WaterbirdDataset
+from utils import ImageNet
+from utils import bernoulli_kl
+from custom_datasets import ColoredMNIST
+from modeling.clip_model import ClipModel, ClipDisentangleModel
 from modeling.vit import ViTHeadModel
 from utils import ImageNetDataset
 
@@ -79,6 +88,7 @@ from transformers import Trainer
 import torch
 import torch.nn as nn
 
+from transformers import TrainerCallback
 
 class ImageClassifierTrainer(Trainer):
     def __init__(self, *args, **kwargs):
@@ -99,6 +109,9 @@ class ImageClassifierTrainer(Trainer):
         self.warmup_type = kwargs.pop('warmup_type', 'linear')
         self.gpt2_model = kwargs.pop('gpt2_model', None)
         self.skip_layer_loss_if_higher_sparsity = kwargs.pop('skip_layer_loss_if_higher_sparsity', False)
+        self.loss_type = kwargs.pop('loss_type', 'kl')
+        self.target_class = kwargs.pop('target_class', None)
+        self.alpha = kwargs.pop('alpha', 1.0)
 
         self.digits = None
         self.device_count = torch.cuda.device_count()
@@ -141,23 +154,29 @@ class ImageClassifierTrainer(Trainer):
             return self.target_layer_sparsity
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        corr_images = inputs.pop("corr_inputs")
+        if inputs['corr_inputs'] is not None:
+            corr_images = inputs.pop("corr_inputs")
+        else:
+            inputs.pop("corr_inputs")
+            corr_images = 'zero_ablate'
         clean_images = inputs.pop("inputs")
 
         bsz = clean_images.shape[0]
 
         with torch.no_grad():
             # First get the logits from the GPT-2 model
-            gpt2_output = self.gpt2_model(input_images=clean_images, **inputs, output_writer_states=True)
-            gpt2_logits = gpt2_output.logits
-            gpt2_logits = torch.nn.functional.log_softmax(gpt2_logits, dim=-1)
-            gpt2_activation = gpt2_output.writer_states
+            if not self.loss_type == 'target':
+                gpt2_output = self.gpt2_model(input_images=clean_images, **inputs)
+                gpt2_logits = gpt2_output.logits
+                gpt2_logits = torch.nn.functional.log_softmax(gpt2_logits, dim=-1) if gpt2_logits.shape[-1] > 1 else gpt2_logits
+            # gpt2_activation = gpt2_output.writer_states
 
             # Now run the corrupted inputs through it, and retain the activations
             if corr_images == 'zero_ablate':
-                corr_x = torch.zeros_like(gpt2_activation)
-            elif corr_images.shape == gpt2_activation.shape:
-                corr_x = corr_images
+                #TODO this is hard coded
+                corr_x = torch.zeros((156, bsz, 197, 768))
+            elif len(corr_images.shape) == 3:
+                corr_x = corr_images.unsqueeze(1).repeat(1, bsz, 1, 1)
             else:
                 corr_x = self.gpt2_model(input_images=corr_images, **inputs, output_writer_states=True).writer_states
 
@@ -183,14 +202,35 @@ class ImageClassifierTrainer(Trainer):
         ## Restricting to 01-99 for now
         # Only the last position
         logits = outputs.logits
-        logits = torch.nn.functional.log_softmax(logits, dim=-1)
+        logits = torch.nn.functional.log_softmax(logits, dim=-1) if logits.shape[-1] > 1 else logits
 
-        kl_loss = nn.functional.kl_div(logits, gpt2_logits, reduction="batchmean", log_target=True)
-
-        loss = kl_loss + reg_loss
+        if self.loss_type == 'partial_kl':
+            assert logits.shape[-1] > 1, "the model only output one class, partial kl is not supported"
+            if isinstance(self.target_class, list):
+                target_classes = torch.tensor(self.target_class)
+                circuit_loss = nn.functional.kl_div(logits[:, target_classes], gpt2_logits[:, target_classes], reduction="batchmean", log_target=True)
+            else:
+                circuit_loss = nn.functional.kl_div(logits[:, self.target_class], gpt2_logits[:, self.target_class], reduction="batchmean", log_target=True)
+        elif self.loss_type == 'kl':
+            if logits.shape[-1] > 1:
+                circuit_loss = nn.functional.kl_div(logits, gpt2_logits, reduction="batchmean", log_target=True)
+            else:
+                circuit_loss = bernoulli_kl(logits, gpt2_logits, reduction="batchmean")
+        elif self.loss_type == 'target':
+            circuit_loss = outputs.lm_loss
+        elif self.loss_type == 'logit_difference':
+            chosen_class = torch.argmax(gpt2_logits, dim=-1)
+            circuit_loss = ((gpt2_logits[:, chosen_class] - logits[:, chosen_class]) ** 2).mean()
+        else:
+            raise NotImplementedError
+        loss = self.alpha * circuit_loss + reg_loss
         outputs["loss"] = loss
-        outputs["kl_loss"] = kl_loss
-        outputs["prob_digits"] = torch.nn.functional.softmax(logits, dim=-1)
+        outputs["circuit_loss"] = circuit_loss
+        outputs["prob_digits"] = torch.nn.functional.softmax(logits, dim=-1) if logits.shape[-1] > 1 else torch.sigmoid(logits)
+        self.log({
+                "train/circuit_loss": circuit_loss.item(),
+                "train/reg_edge_loss": reg_edge_loss.mean().item(),
+            })
 
         return (loss, outputs) if return_outputs else loss
 
@@ -291,6 +331,22 @@ class DataTrainingArguments:
         default="noise",
         metadata={"help": "The mode of corrupted input."}
     )
+    loss_type: Optional[str] = field(
+        default="kl",
+        metadata={"help": "The type of loss"}
+    )
+    dataset: Optional[str] = field(
+        default="imagenet",
+        metadata={"help": "The type of loss"}
+    )
+    ood_dataset: Optional[str] = field(
+        default="v2",
+        metadata={"help": "The type of loss"}
+    )
+    alpha: Optional[float] = field(
+        default=1.0,
+        metadata={"help": "The type of loss"}
+    )
 
 @dataclass
 class ModelArguments:
@@ -338,6 +394,27 @@ class ModelArguments:
         default="gpt2",
         metadata={"help": "The model to initialize from."},
     )
+    include_qkv: bool = field(
+        default=True,
+        metadata={"help": "Include qkv edges or not."},
+    )
+    ft_method: str = field(
+        default="FT",
+        metadata={"help": "The interpreted model"},
+    )
+    target_class: str = field(
+        default='0',
+        metadata={"help": "target class of the circuit"},
+    )
+    ckpt_id: str = field(
+        default='0',
+        metadata={"help": "target class of the circuit"},
+    )
+
+    def __post_init__(self):
+        # Convert purely numeric string inputs to integers, keep WNIDs as strings
+        if self.target_class.isdigit():
+            self.target_class = int(self.target_class)
 
 def format_instance(instance, split):
     if isinstance(instance, dict) and "min_steps" in instance:
@@ -372,12 +449,36 @@ def load_datasets(dataset_path, max_train_samples, max_eval_samples, train_split
     return dataset
 
 
-with open("/data/nvme1/yxpeng/PycharmProjects/Edge-Pruning/src/modeling/mean_imagenet_val.pkl", "rb") as f:  # "rb" = read binary
-    loaded_data = pickle.load(f)
-print('here1')
+
 class DataCollator:
-    def __init__(self, mode):
+    def __init__(self, mode, loaded_activation=None, ood_dataset=None):
         self.mode = mode
+        self.loaded_activation = loaded_activation
+        self.ood_dataset = ood_dataset
+        self.ood_class_index = self._build_class_index(ood_dataset) if ood_dataset else None
+
+    def _build_class_index(self, dataset):
+        class_index = {}
+        if hasattr(dataset, 'target_name'):
+            for idx, label in enumerate(getattr(dataset, dataset.target_name)):  # or dataset.labels
+                label = int(label)
+                if label not in class_index:
+                    class_index[label] = []
+                class_index[label].append(idx)
+        else:
+            for idx, data in enumerate(dataset):
+                if len(data) == 2:
+                    image, label = data
+                    _ = None
+                elif len(data) == 3:
+                    image, label, _ = data
+                else:
+                    raise ValueError("Unexpected number of items returned by dataset")
+                label = int(label)  # Ensure consistent key type
+                if label not in class_index:
+                    class_index[label] = []
+                class_index[label].append(idx)
+        return class_index
 
     def __call__(self, examples):
         inputs = []
@@ -401,10 +502,9 @@ class DataCollator:
                 input = example[0]
                 inputs.append(input)
                 labels.append(example[1])
-            corr_i = loaded_data.unsqueeze(1).repeat(1, len(examples), 1, 1)
             return {
                 "inputs": torch.stack(inputs),
-                "corr_inputs": corr_i,
+                "corr_inputs": self.loaded_activation,
                 "labels": torch.tensor(labels),
             }
         elif self.mode == 'zero':
@@ -417,11 +517,37 @@ class DataCollator:
                 "corr_inputs": None,
                 "labels": torch.tensor(labels),
             }
+        elif self.mode == 'color':
+            for i, example in enumerate(examples):
+                input = example[0]
+                corr_image = input[[1, 0, 2]]
+                inputs.append(input)
+                corr_inputs.append(corr_image)
+                labels.append(example[1])
+            return {
+                "inputs": torch.stack(inputs),
+                "corr_inputs": torch.stack(corr_inputs),
+                "labels": torch.tensor(labels),
+            }
+        elif self.mode == 'ood' or self.mode == 'ood_failure':
+            for i, example in enumerate(examples):
+                input = example[0]
+                label = example[1]
+
+                corr_image = self.ood_dataset[random.choice(self.ood_class_index[label])][0]
+                corr_inputs.append(corr_image)
+                inputs.append(input)
+                labels.append(label)
+            return {
+                "inputs": torch.stack(inputs),
+                "corr_inputs": torch.stack(corr_inputs),
+                "labels": torch.tensor(labels),
+            }
 
 def eval_fn(eval_pred):         
     (
         _, logits, target_edge_sparsity, target_layer_sparsity, model_edge_sparsity, model_layer_sparsity, reg_edge_loss, reg_layer_loss,
-        kl_loss, prob_digits
+        circuit_loss, prob_digits
     ) = eval_pred.predictions
     labels = eval_pred.label_ids
     
@@ -436,12 +562,12 @@ def eval_fn(eval_pred):
         target_edge_sparsity = target_edge_sparsity.item()
         target_layer_sparsity = target_layer_sparsity.item()
     
-    predictions = np.argmax(logits, axis=-1)
+    predictions = np.argmax(logits, axis=-1) if logits.shape[-1] > 1 else (logits > 0).astype(int)
 
     correct = (predictions == labels).sum()
     accuracy = correct.item() / labels.shape[0]
     
-    kl_loss = kl_loss.mean().item()
+    circuit_loss = circuit_loss.mean().item()
     reg_edge_loss = reg_edge_loss.mean().item()
     reg_layer_loss = reg_layer_loss.mean().item()
     
@@ -451,7 +577,7 @@ def eval_fn(eval_pred):
         "model_layer_sparsity": model_layer_sparsity,
         "target_edge_sparsity": target_edge_sparsity,
         "target_layer_sparsity": target_layer_sparsity,
-        "eval_kl_loss": kl_loss,
+        "eval_circuit_loss": circuit_loss,
         "eval_reg_edge_loss": reg_edge_loss,
         "eval_reg_layer_loss": reg_layer_loss,
     }
@@ -570,34 +696,200 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
-    imagenet_val = ImageNetDataset(root_dir='/data/nvme1/yxpeng/imagenet/val',
-                                   processor=AutoImageProcessor.from_pretrained("google/vit-base-patch16-224"))
-    train_size = int(0.96 * len(imagenet_val))
-    eval_size = len(imagenet_val) - train_size
-    train_dataset, eval_dataset = random_split(imagenet_val, [train_size, eval_size])
-    raw_datasets = {'train': train_dataset, 'validation': eval_dataset}
-    n_train = len(raw_datasets["train"])
-    vit_model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
-    state_dict = vit_model.state_dict()
-    new_state_dict = {}
-    for old_key, value in state_dict.items():
-        if "vit.encoder.layer" in old_key:
-            new_key = old_key.replace("vit.encoder.layer", "vit.encoder")
-            new_state_dict[new_key] = value
+
+    from robustness.tools.imagenet_helpers import common_superclass_wnid, ImageNetHierarchy
+    in_path = '/data/nvme1/yxpeng/imagenet/'
+    in_info_path = '/data/nvme1/yxpeng/imagenet'
+    in_hier = ImageNetHierarchy(in_path, in_info_path)
+    if isinstance(model_args.target_class, str) and data_args.dataset == 'imagenet':
+        class_ranges, label_map = in_hier.get_subclasses([model_args.target_class],
+                                                         balanced=False)
+        class_ranges = list(class_ranges[0])
+    else:
+        class_ranges = model_args.target_class
+
+    ood_dataset = None
+    if data_args.dataset == 'imagenet':
+        transform = transforms.Compose([
+            transforms.Resize(size=224, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(size=224),
+            transforms.ToTensor()
+        ])
+        if model_args.ft_method == 'google':
+            dataset = ImageNetDataset(root_dir='/data/nvme1/yxpeng/imagenet/train',
+                                               processor=AutoImageProcessor.from_pretrained("google/vit-base-patch16-224"), select_class=class_ranges)
+            ood_dataset = ImageNet(root='/data/nvme1/yxpeng/imagenet', split=data_args.ood_dataset, processor=AutoImageProcessor.from_pretrained("google/vit-base-patch16-224"))
         else:
-            new_state_dict[old_key] = value
-    model = ViTHeadModel.from_pretrained(
-        model_args.initialize_from,
-        state_dict=new_state_dict,
-        with_embedding_nodes=data_args.with_embedding_nodes,
-        disable_linear_regularization_term=data_args.disable_linear_reg_term,
-    )
-    gpt2_model = ViTHeadModel.from_pretrained(
-        model_args.initialize_from,
-        state_dict=new_state_dict,
-        with_embedding_nodes=data_args.with_embedding_nodes,
-    ).to("cuda")
-    
+            dataset = ImageNetDataset(root_dir='/data/nvme1/yxpeng/imagenet/train',
+                                               transform=transform, select_class=class_ranges)
+            ood_dataset = ImageNet(root='/data/nvme1/yxpeng/imagenet', split=data_args.ood_dataset, transform=transform)
+    elif data_args.dataset == 'waterbirds':
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        dataset = WaterbirdDataset(data_correlation=0.95, split="train", root_dir="/data/nvme1/yxpeng/PycharmProjects/vit-spurious-robustness/datasets", transform=transform)
+        ood_dataset = WaterbirdDataset(data_correlation=0.95, split="val", root_dir="/data/nvme1/yxpeng/PycharmProjects/vit-spurious-robustness/datasets", transform=transform)
+    elif data_args.dataset == 'colored_mnist_all_train':
+        dataset = ColoredMNIST(root='/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/new_data', env='all_train', select_class=model_args.target_class,
+                                     transform=transforms.Compose([
+                                         transforms.ToTensor(),
+                                         transforms.Normalize((0.1307, 0.1307, 0.), (0.3081, 0.3081, 0.3081))
+                                     ]))
+        ood_dataset = ColoredMNIST(root='/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/new_data',
+                               env='test', select_class='all',
+                               transform=transforms.Compose([
+                                   transforms.ToTensor(),
+                                   transforms.Normalize((0.1307, 0.1307, 0.), (0.3081, 0.3081, 0.3081))
+                               ]))
+    elif data_args.dataset == 'colored_mnist_all_train_unbiased':
+        dataset = ColoredMNIST(root='/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/new_data', env='all_train_unbiased', select_class=model_args.target_class,
+                                     transform=transforms.Compose([
+                                         transforms.ToTensor(),
+                                         transforms.Normalize((0.1307, 0.1307, 0.), (0.3081, 0.3081, 0.3081))
+                                     ]))
+        ood_dataset = ColoredMNIST(root='/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/new_data',
+                               env='test', select_class='all',
+                               transform=transforms.Compose([
+                                   transforms.ToTensor(),
+                                   transforms.Normalize((0.1307, 0.1307, 0.), (0.3081, 0.3081, 0.3081))
+                               ]))
+    else:
+        ood_dataset = None
+    train_size = int(0.8 * len(dataset))
+    eval_size = len(dataset) - train_size
+    train_dataset, eval_dataset = random_split(dataset, [train_size, eval_size])
+    raw_datasets = {'train': train_dataset, 'validation': eval_dataset}
+
+    if model_args.ft_method == 'google':
+        vit_model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
+        state_dict = vit_model.state_dict()
+        new_state_dict = {}
+        for old_key, value in state_dict.items():
+            if "vit.encoder.layer" in old_key:
+                new_key = old_key.replace("vit.encoder.layer", "vit.encoder")
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[old_key] = value
+        model = ViTHeadModel.from_pretrained(
+            'google/vit-base-patch16-224',
+            state_dict=new_state_dict,
+            include_qkv=model_args.include_qkv,
+            with_embedding_nodes=data_args.with_embedding_nodes,
+            disable_linear_regularization_term=data_args.disable_linear_reg_term,
+        ).eval()
+        gpt2_model = ViTHeadModel.from_pretrained(
+            'google/vit-base-patch16-224',
+            include_qkv=model_args.include_qkv,
+            state_dict=new_state_dict,
+            with_embedding_nodes=data_args.with_embedding_nodes,
+        ).to("cuda").eval()
+    elif model_args.ft_method == 'IN21k-ERM-WaterBird':
+        ckpt = torch.load(f'/data/nvme1/yxpeng/PycharmProjects/vit-spurious-robustness/output/waterbirds_exp/waterbirds/ViT/ViT-B_16{model_args.ckpt_id}.bin')
+        new_state_dict = {}
+        for old_key, value in ckpt.items():
+            if "vit.encoder.layer" in old_key:
+                new_key = old_key.replace("vit.encoder.layer", "vit.encoder")
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[old_key] = value
+        model = ViTHeadModel.from_pretrained(
+            'google/vit-base-patch16-224-in21k',
+            state_dict=new_state_dict,
+            include_qkv=model_args.include_qkv,
+            with_embedding_nodes=data_args.with_embedding_nodes,
+            disable_linear_regularization_term=data_args.disable_linear_reg_term,
+        ).eval()
+        gpt2_model = ViTHeadModel.from_pretrained(
+            'google/vit-base-patch16-224-in21k',
+            include_qkv=model_args.include_qkv,
+            state_dict=new_state_dict,
+            with_embedding_nodes=data_args.with_embedding_nodes,
+        ).to("cuda").eval()
+        if data_args.corr_mode == 'ood_failure':
+            failure_list = get_failure_list(f'/data/nvme1/yxpeng/PycharmProjects/Edge-Pruning/failure/IN21k-ERM-WaterBird-{model_args.ckpt_id}.p', ood_dataset, gpt2_model)
+            ood_dataset.filter_from_list(failure_list)
+    elif model_args.ft_method == 'ERM' or model_args.ft_method == 'IRM' or model_args.ft_method == 'DRO':
+        vit_config = ViTConfig(image_size=28, patch_size=7, num_hidden_layers=2, num_attention_heads=4,
+                           intermediate_size=256 * 3,
+                           num_channels=3, num_labels=1)
+        if model_args.ft_method == 'ERM':
+            vit_ckpt = f'/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/checkpoints/vit_erm/ViT_coloredmnist_erm_test_{model_args.ckpt_id}.pt'
+        elif model_args.ft_method == 'IRM':
+            vit_ckpt = f'/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/checkpoints/vit_irm_new/ViT_coloredmnist_irm_test_{model_args.ckpt_id}.pt'
+        elif model_args.ft_method == 'DRO':
+            vit_ckpt = f'/data/nvme1/yxpeng/PycharmProjects/pyvenv-experiments/vision-grokking/checkpoints/vit_dro_new/ViT_coloredmnist_dro_test_{model_args.ckpt_id}.pt'
+        state_dict = torch.load(vit_ckpt)
+        new_state_dict = {}
+        for old_key, value in state_dict.items():
+            if "vit.encoder.layer" in old_key:
+                new_key = old_key.replace("vit.encoder.layer", "vit.encoder")
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[old_key] = value
+        model = ViTHeadModel(
+            config=vit_config,
+            state_dict=new_state_dict,
+            include_qkv=model_args.include_qkv,
+            with_embedding_nodes=data_args.with_embedding_nodes,
+            disable_linear_regularization_term=data_args.disable_linear_reg_term,
+        ).eval()
+        gpt2_model = ViTHeadModel(
+            config=vit_config,
+            include_qkv=model_args.include_qkv,
+            state_dict=new_state_dict,
+            with_embedding_nodes=data_args.with_embedding_nodes,
+        ).to("cuda").eval()
+    else:
+        vit_config = ViTConfig()
+        vit_config.embedding_bias = False
+        vit_config.layernorm_pre = True
+        vit_config.layer_norm_eps = 1e-5
+        vit_config.proj = True
+        vit_config.hidden_act = 'quick_gelu'
+        if model_args.ft_method == 'FT':
+            clip_checkpoint = "/data/nvme1/yxpeng/PycharmProjects/transfer_learning/logs/full_ft_imagenet_clip_vit_b16/optimizer.args.lr-0.001_with_augment_seed-0_run0/checkpoints/ckp_best_val"
+        elif model_args.ft_method == 'LP':
+            clip_checkpoint = "/data/nvme1/yxpeng/PycharmProjects/transfer_learning/logs/linprobe_imagenet_clip_vit_b16/weights_0.pkl"
+        model = ClipDisentangleModel('ViT-B/16', vit_config, include_qkv=model_args.include_qkv, checkpoint=clip_checkpoint).eval()
+        gpt2_model = ClipDisentangleModel('ViT-B/16', vit_config, include_qkv=model_args.include_qkv, checkpoint=clip_checkpoint).to('cuda').eval()
+
+    # test the loaded model's accuracy
+    # from tqdm import tqdm
+    # batch_size = 16  # Adjust as needed
+    # val_loader = DataLoader(imagenet_val, batch_size=batch_size, shuffle=True)
+    # origin_model = ClipModel('ViT-B/16').to(torch.float32).to('cuda').eval()
+    # with torch.no_grad():
+    #     i = 0
+    #     align = 0
+    #     total = 0
+    #     correct = 0
+    #     zero_shot_correct = 0
+    #     for batch in tqdm(val_loader):
+    #         images, labels = batch  # Assuming dataset returns (image, label)
+    #         images = images.to("cuda")
+    #         labels = labels.to("cuda")
+    #
+    #         # Get predictions from both models
+    #         original_outputs = origin_model.zero_shot_predict(images)
+    #         disentangled_output = gpt2_model(input_images=images, labels=labels).logits
+    #
+    #         # Convert logits to predicted class indices
+    #         vit_preds = torch.argmax(original_outputs, dim=-1)
+    #         gpt2_preds = torch.argmax(disentangled_output, dim=-1)
+    #
+    #         # Compare predictions with ground truth
+    #         align += (vit_preds == gpt2_preds).sum().item()
+    #         zero_shot_correct += (vit_preds == labels).sum().item()
+    #         correct += (gpt2_preds == labels).sum().item()
+    #         total += labels.size(0)
+    #         i += 1
+    #         if i % 20 == 0:
+    #             print(f'align rate: {align/total}')
+    #             print(f'acc: {correct/total}')
+    #             print(f'zero_shot_acc: {zero_shot_correct/total}')
+
     # tokenizer = AutoTokenizer.from_pretrained("gpt2")
     # tokenizer.pad_token = tokenizer.eos_token
     
@@ -614,9 +906,27 @@ def main():
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = raw_datasets["validation"]
 
+    if data_args.corr_mode == 'mean':
+        if data_args.dataset == 'imagenet':
+            # with open("/data/nvme1/yxpeng/PycharmProjects/Edge-Pruning/activations/mean_clip_{model_args.ft_method}_imagenet_val.pkl",
+            #           "rb") as f:  # "rb" = read binary
+            #     loaded_data = pickle.load(f)
+            with open(f"/data/nvme1/yxpeng/PycharmProjects/Edge-Pruning/activations/mean_{model_args.ft_method}_clip_imagenet_train.pkl",
+                      "rb") as f:  # "rb" = read binary
+                loaded_data = pickle.load(f)
+        elif data_args.dataset == 'colored_mnist_all_train' or data_args.dataset == 'colored_mnist_all_train_unbiased':
+            with open(
+                    f"/data/nvme1/yxpeng/PycharmProjects/Edge-Pruning/activations/mean_{model_args.ft_method}_{model_args.ckpt_id}_new_{data_args.dataset}.pkl",
+                    "rb") as f:  # "rb" = read binary
+                loaded_data = pickle.load(f)
+        if loaded_data.is_cuda:
+            loaded_data = loaded_data.detach().cpu()
+    else:
+        loaded_data = None
+
     # Data collator
-    collator = DataCollator(data_args.corr_mode)
-    
+    collator = DataCollator(data_args.corr_mode, loaded_activation=loaded_data, ood_dataset=ood_dataset)
+
     optimizers = get_optimizers(
         model, 
         edges_lr=data_args.edge_learning_rate,
@@ -646,6 +956,9 @@ def main():
         skip_layer_loss_if_higher_sparsity=data_args.stop_optimizing_layer_if_higher_sparsity,
         num_sparsity_warmup_steps=data_args.num_sparsity_warmup_steps,
         warmup_type=data_args.warmup_type,
+        loss_type=data_args.loss_type,
+        alpha=data_args.alpha,
+        target_class=class_ranges,
     )
 
     # Training

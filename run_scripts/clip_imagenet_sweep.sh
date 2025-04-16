@@ -1,4 +1,4 @@
-EDGE_SPARSITIES=(0.94 0.945 0.95 0.955 0.96 0.965 0.97 0.975 0.98 0.985 0.99 0.995 1.0 1.01 1.02 1.05 1.1)
+EDGE_SPARSITIES=(0.96 0.98 1.05)
 
 for i in "${!EDGE_SPARSITIES[@]}"; do
 
@@ -13,6 +13,7 @@ WARMUP=2500
 
 EXTRA="--disable_node_loss"
 TAG="wo_node_loss"
+ABLATE_MODE="mean"
 
 # Uncomment this if you want to run with node loss
 # EXTRA=""
@@ -28,17 +29,16 @@ N_VAL=200 # The val split size
 # If you want to always keep embedding nodes, remove the --with_embedding_nodes flag
 # That flag, when set, also models masks over the embedding nodes
 
-WANDB_MODE=disabled accelerate launch src/prune/fpt2_ioi.py \
+accelerate launch src/prune/clip_vit_imagenet.py \
     --report_to wandb \
     --do_train \
     --do_eval \
-    --dataset_path ./data/datasets/ioi/ \
+    --dataset_path ./data/datasets/gt/ \
     --train_split $train_split \
-    --initialize_from gpt2 \
     --max_seq_length 64 \
-    --per_device_train_batch_size 32 \
+    --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 16 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 4 \
     --eval_accumulation_steps 16 \
     --edge_learning_rate $ELR \
     --layer_learning_rate $LLR \
@@ -58,11 +58,13 @@ WANDB_MODE=disabled accelerate launch src/prune/fpt2_ioi.py \
     --num_sparsity_warmup_steps $WARMUP \
     --max_train_samples $N_TRAIN \
     --max_eval_samples $N_VAL \
-    --output_dir ./data/runs/ioi-${TAG}-elr${ELR}-llr${LLR}-relr${RELR}-rllr${RLLR}-es${EDGE_SPARSITY}-ns${NODE_SPARSITY}-t${TOTAL}/ \
+    --output_dir ./data/runs/${ABLATE_MODE}_ablate-target_loss-clip-imagenet-${TAG}-elr${ELR}-llr${LLR}-relr${RELR}-rllr${RLLR}-es${EDGE_SPARSITY}-ns${NODE_SPARSITY}-t${TOTAL}/ \
     --remove_unused_columns false \
     --dataloader_num_workers 0 \
     --warmup_type linear \
     --with_embedding_nodes \
+    --corr_mode $ABLATE_MODE \
+    --ddp_find_unused_parameters False \
     $EXTRA
 
 done

@@ -207,7 +207,7 @@ def get_num_edges(config, with_embedding_nodes=False):
 
 def get_num_nodes(config, with_embedding_nodes=False):
     # This only counts writer nodes
-    return get_num_writers(config) 
+    return get_num_writers(config, with_embedding_nodes)
 
 def get_base_indices_for_layer(config, l, with_embedding_nodes=False):
     writer_offset = 2 if with_embedding_nodes else 0
